@@ -1,102 +1,75 @@
 const http = require("http");
-const fs = require("fs");
-const path = require("path");
 const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 3000;
-const UPSTREAM_URL = process.env.UPSTREAM_URL || "wss://YOUR-SERVER.eagler.host/";
-
-const publicDir = path.join(__dirname, "public");
-const indexFile = path.join(publicDir, "index.html");
-
-function sendFile(res, filePath, contentType = "text/html; charset=utf-8") {
-  fs.readFile(filePath, (err, data) => {
-    if (err) {
-      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
-      res.end("Not found");
-      return;
-    }
-    res.writeHead(200, { "Content-Type": contentType });
-    res.end(data);
-  });
-}
+const UPSTREAM_URL = process.env.UPSTREAM_URL || "wss://m3tr0m0l4.eagler.host/";
 
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("ok");
     return;
   }
-
-  if (req.url === "/" || req.url === "/index.html") {
-    return sendFile(res, indexFile);
-  }
-
-  const safePath = path.normalize(req.url).replace(/^(\.\.[/\\])+/, "");
-  const filePath = path.join(publicDir, safePath);
-
-  const ext = path.extname(filePath).toLowerCase();
-  const types = {
-    ".html": "text/html; charset=utf-8",
-    ".js": "application/javascript; charset=utf-8",
-    ".css": "text/css; charset=utf-8",
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".svg": "image/svg+xml",
-    ".json": "application/json; charset=utf-8"
-  };
-
-  if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-    return sendFile(res, filePath, types[ext] || "application/octet-stream");
-  }
-
-  return sendFile(res, indexFile);
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("proxy running");
 });
 
 const wss = new WebSocket.Server({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
+  console.log("upgrade:", req.url);
+
   wss.handleUpgrade(req, socket, head, (clientWs) => {
-    const upstreamWs = new WebSocket(UPSTREAM_URL, {
-      headers: {
-        "X-Forwarded-For":
-          req.headers["x-forwarded-for"] ||
-          req.socket.remoteAddress ||
-          "",
-        "X-Real-IP": req.socket.remoteAddress || ""
-      }
-    });
-
-    const queue = [];
+    const upstreamWs = new WebSocket(UPSTREAM_URL);
+    const pending = [];
     let upstreamOpen = false;
-
-    clientWs.on("message", (msg) => {
-      if (upstreamOpen) upstreamWs.send(msg);
-      else queue.push(msg);
-    });
 
     upstreamWs.on("open", () => {
       upstreamOpen = true;
-      while (queue.length) upstreamWs.send(queue.shift());
+      console.log("upstream open:", UPSTREAM_URL);
+      while (pending.length) {
+        const { msg, isBinary } = pending.shift();
+        upstreamWs.send(msg, { binary: isBinary });
+      }
     });
 
-    upstreamWs.on("message", (msg) => {
-      if (clientWs.readyState === WebSocket.OPEN) clientWs.send(msg);
+    clientWs.on("message", (msg, isBinary) => {
+      if (upstreamOpen) {
+        upstreamWs.send(msg, { binary: isBinary });
+      } else {
+        pending.push({ msg, isBinary });
+      }
     });
 
-    const closeBoth = () => {
-      try { clientWs.close(); } catch {}
+    upstreamWs.on("message", (msg, isBinary) => {
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(msg, { binary: isBinary });
+      }
+    });
+
+    clientWs.on("close", () => {
+      console.log("client closed");
       try { upstreamWs.close(); } catch {}
-    };
+    });
 
-    clientWs.on("close", closeBoth);
-    upstreamWs.on("close", closeBoth);
-    clientWs.on("error", closeBoth);
-    upstreamWs.on("error", closeBoth);
+    upstreamWs.on("close", () => {
+      console.log("upstream closed");
+      try { clientWs.close(); } catch {}
+    });
+
+    clientWs.on("error", (err) => {
+      console.error("client error:", err.message);
+      try { upstreamWs.close(); } catch {}
+    });
+
+    upstreamWs.on("error", (err) => {
+      console.error("upstream error:", err.message);
+      try { clientWs.close(); } catch {}
+    });
   });
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Proxy listening on ${PORT}`);
+  console.log(`listening on ${PORT}`);
+  console.log(`UPSTREAM_URL=${UPSTREAM_URL}`);
 });
